@@ -132,6 +132,75 @@ WF_oracle_ru_upgrade
   - 参数收口
   - 导出本次变更执行摘要（JSON/Markdown）
 
+### 5.3 JT00 + JT01 工作流细化（结合两份文档）
+
+> 本节细化依据同时来自：  
+> 1) `AAP_Oracle_RU_升级编排设计方案_v1.md` 的流程定义（JT00 -> JT01）  
+> 2) `Dbass_RU_生产升级步骤梳理.md` 的实操命令（`precheck_db.sh`、`--step_00_precheck`、`mkdir/cp/rm`）
+
+#### 5.3.1 JT00/JT01 子流程（中期先落地版本）
+
+```text
+WF_ru_mid_jt00_jt01
+  -> JT00_precheck
+      on_success -> JT01_prepare_dirs_cleanup
+      on_failure -> JT00_Fail_Notify_End
+  -> JT01_prepare_dirs_cleanup
+      on_success -> JT01_Success_Notify_End
+      on_failure -> JT01_Fail_Notify_End
+```
+
+- 先严格串行：保证“先确认可升级，再做目录准备和清理”；
+- 暂不加入审批点，审批点仍放在后续全流程（JT05/JT08 周边）；
+- 失败即终止，不自动跨步骤继续，避免把环境带入未知状态。
+
+#### 5.3.2 JT00_precheck（命令与判定）
+
+**目标**：只做检查，不做升级改写。  
+**对应人工步骤**：`Dbass` 文档 1.1 + 2.1。
+
+| 子步骤 | AAP 动作 | 命令（按顺序） | 成功标准 | 失败处理 |
+|---|---|---|---|---|
+| JT00-1 | 校验工具目录和脚本存在性 | `test -d ${TOOL_DIR}`、`test -f ${TOOL_DIR}/upgrade_ru_with_opatch`、`test -f ${TOOL_DIR}/precheck_db.sh` | 三项检查通过 | 直接 fail，输出缺失项 |
+| JT00-2 | 执行数据库预检查 | `cd ${TOOL_DIR} && sh precheck_db.sh` | 返回码=0 | fail，记录 stdout/stderr |
+| JT00-3 | 执行 RU 工具预检查 | `cd ${TOOL_DIR} && perl upgrade_ru_with_opatch --step_00_precheck` | 返回码=0 | fail，记录 stdout/stderr |
+| JT00-4 | 结果结构化归档 | 生成 `jt00_result.json`（含 change_id、host、rc、关键摘要） | 产物写入成功 | fail 并标记“检查结果未落盘” |
+
+**JT00 建议阻断关键字（命中即失败）**：`ERROR`、`FAILED`、`CONFLICT`、`PREREQ`。  
+**JT00 输入变量（最小集）**：`change_id`、`tool_dir`、`target_hosts`、`strict_mode`。
+
+#### 5.3.3 JT01_prepare_dirs_cleanup（命令与判定）
+
+**目标**：准备目录、复制工具、清理历史残留，且可重复执行（幂等）。  
+**对应人工步骤**：`Dbass` 文档 1.2 + 1.3。
+
+| 子步骤 | AAP 动作 | 命令（示例） | 成功标准 | 失败处理 |
+|---|---|---|---|---|
+| JT01-1 | 创建目录（Node1/Node2） | `mkdir -p ${BACKUP_DIR_NODE1}`；`mkdir -p ${BACKUP_DIR_NODE2}`；`mkdir -p ${PATCH_BASE}/gimage` | 目录存在且权限符合要求 | fail，输出失败路径 |
+| JT01-2 | 复制 RU 工具目录 | `cp -r /u01/patch1926/ru.20241125 ${PATCH_BASE}/`（按现场源路径参数化） | 目标目录存在可读 | fail，输出源/目标路径 |
+| JT01-3 | 白名单清理历史残留 | `rm -rf /u01/patch1926`；`rm -rf /u01/app/oracle/product/19.0.0.0/dbhome_1.backup.for.switch_back`；`rm -rf /u01/app/19.0.0.0/grid.backup.for.switch_back` | 指定残留不存在 | fail，停止后续步骤 |
+| JT01-4 | 清理后再校验与归档 | 校验关键目录状态并生成 `jt01_result.json` | 产物写入成功 | fail 并标记“准备阶段未闭环” |
+
+**JT01 安全约束**：  
+- 清理路径仅允许白名单（固定前缀 `/u01/patch*`、`/u01/app/...backup.for.switch_back`）；  
+- 禁止空变量执行删除（如 `rm -rf ${VAR}` 时 `VAR` 为空）；  
+- `safe_cleanup=true` 时，非白名单路径一律拒绝执行。
+
+#### 5.3.4 JT00/JT01 与 AAP 配置映射（建议值）
+
+- **Execution Environment**：预装 perl + oracle 客户端常用命令；
+- **Job Type**：Run；
+- **Verbosity**：2（联调期可临时升到 3）；
+- **Timeout**：JT00=3600s，JT01=1800s；
+- **Artifacts**：`/tmp/aap_ru/${change_id}/jt00_result.json`、`/tmp/aap_ru/${change_id}/jt01_result.json`；
+- **并发策略**：JT00/JT01 阶段建议串行（`serial: 1`），避免并发清理风险。
+
+#### 5.3.5 本轮细化的边界说明
+
+- 本节仅细化 JT00/JT01，不展开 JT02+；
+- 继续坚持“编排接入优先，RU 工具不重写”的原则；
+- 下一步可基于本节直接输出 JT00/JT01 Playbook skeleton（含任务、变量、失败分支）。
+
 ---
 
 ## 6. 与变更平台对接（重点）
@@ -365,4 +434,3 @@ WF_oracle_ru_upgrade
 - 提供 AAP 到目标主机的网络与权限可达性；
 - 提供凭据系统运行时取数链路；
 - 提供 UAT/生产变更窗口与审批配合。
-
