@@ -1,0 +1,129 @@
+---
+- name: JT00 - Oracle RU precheck
+  hosts: all
+  gather_facts: false
+
+  vars:
+    change_id: "CHG-UNKNOWN"
+    tool_dir: "/u01/patch1928/ru.20241125"
+    precheck_script: "precheck_db.sh"
+    opatch_script: "upgrade_ru_with_opatch"
+    strict_mode: true
+    artifact_base_dir: "/tmp/aap_ru"
+    block_keywords:
+      - "ERROR"
+      - "FAILED"
+      - "CONFLICT"
+      - "PREREQ"
+
+  tasks:
+    - name: Validate required variables for JT00
+      ansible.builtin.assert:
+        that:
+          - change_id | length > 0
+          - tool_dir | length > 0
+          - precheck_script | length > 0
+          - opatch_script | length > 0
+        fail_msg: "JT00 required variables are missing."
+
+    - name: Ensure JT00 artifact directory exists
+      ansible.builtin.file:
+        path: "{{ artifact_base_dir }}/{{ change_id }}"
+        state: directory
+        mode: "0750"
+
+    - name: Check tool_dir exists
+      ansible.builtin.stat:
+        path: "{{ tool_dir }}"
+      register: tool_dir_stat
+
+    - name: Check precheck script exists
+      ansible.builtin.stat:
+        path: "{{ tool_dir }}/{{ precheck_script }}"
+      register: precheck_script_stat
+
+    - name: Check opatch script exists
+      ansible.builtin.stat:
+        path: "{{ tool_dir }}/{{ opatch_script }}"
+      register: opatch_script_stat
+
+    - name: Fail if prerequisite files are missing
+      ansible.builtin.assert:
+        that:
+          - tool_dir_stat.stat.exists
+          - tool_dir_stat.stat.isdir
+          - precheck_script_stat.stat.exists
+          - opatch_script_stat.stat.exists
+        fail_msg: >-
+          Missing prerequisites under {{ tool_dir }}.
+          tool_dir={{ tool_dir_stat.stat.exists | default(false) }}
+          precheck_script={{ precheck_script_stat.stat.exists | default(false) }}
+          opatch_script={{ opatch_script_stat.stat.exists | default(false) }}
+
+    - name: Run database precheck script
+      ansible.builtin.shell: "cd {{ tool_dir }} && sh {{ precheck_script }}"
+      register: precheck_cmd
+      changed_when: false
+
+    - name: Run RU tool precheck
+      ansible.builtin.shell: "cd {{ tool_dir }} && perl {{ opatch_script }} --step_00_precheck"
+      register: opatch_precheck_cmd
+      changed_when: false
+
+    - name: Build merged output for keyword detection
+      ansible.builtin.set_fact:
+        jt00_merged_output: >-
+          {{
+            (
+              (precheck_cmd.stdout | default('')) ~ '\n' ~
+              (precheck_cmd.stderr | default('')) ~ '\n' ~
+              (opatch_precheck_cmd.stdout | default('')) ~ '\n' ~
+              (opatch_precheck_cmd.stderr | default(''))
+            ) | upper
+          }}
+
+    - name: Detect blocking keywords from output
+      ansible.builtin.set_fact:
+        jt00_detected_keywords: "{{ block_keywords | select('in', jt00_merged_output) | list }}"
+
+    - name: Fail when strict mode detects blocking keywords
+      ansible.builtin.fail:
+        msg: "JT00 blocked by keywords: {{ jt00_detected_keywords | join(', ') }}"
+      when:
+        - strict_mode | bool
+        - jt00_detected_keywords | length > 0
+
+    - name: Build JT00 result object
+      ansible.builtin.set_fact:
+        jt00_result:
+          stage: "JT00_precheck"
+          change_id: "{{ change_id }}"
+          host: "{{ inventory_hostname }}"
+          timestamp: "{{ lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ') }}"
+          tool_dir: "{{ tool_dir }}"
+          strict_mode: "{{ strict_mode | bool }}"
+          commands:
+            - "sh {{ precheck_script }}"
+            - "perl {{ opatch_script }} --step_00_precheck"
+          rc:
+            precheck_db_sh: "{{ precheck_cmd.rc }}"
+            step_00_precheck: "{{ opatch_precheck_cmd.rc }}"
+          detected_block_keywords: "{{ jt00_detected_keywords }}"
+          success: >-
+            {{
+              (precheck_cmd.rc == 0) and
+              (opatch_precheck_cmd.rc == 0) and
+              ((not strict_mode | bool) or (jt00_detected_keywords | length == 0))
+            }}
+
+    - name: Persist JT00 result json artifact
+      ansible.builtin.copy:
+        dest: "{{ artifact_base_dir }}/{{ change_id }}/jt00_result_{{ inventory_hostname }}.json"
+        content: "{{ jt00_result | to_nice_json }}\n"
+        mode: "0640"
+
+    - name: Publish JT00 summary to workflow stats
+      ansible.builtin.set_stats:
+        data:
+          jt00_success: "{{ jt00_result.success }}"
+          jt00_artifact: "{{ artifact_base_dir }}/{{ change_id }}/jt00_result_{{ inventory_hostname }}.json"
