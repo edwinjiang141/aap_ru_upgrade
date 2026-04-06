@@ -1,0 +1,131 @@
+---
+- name: JT01 - Prepare directories and cleanup
+  hosts: all
+  gather_facts: false
+
+  vars:
+    change_id: "CHG-UNKNOWN"
+    patch_base: "/u01/patch1928"
+    backup_dir_node1: "/u01/patch1928/rac1_backup1928"
+    backup_dir_node2: "/u01/patch1928/rac2_backup1928"
+    gimage_dir: "{{ patch_base }}/gimage"
+    ru_tool_source: "/u01/patch1926/ru.20241125"
+    ru_tool_dest_parent: "{{ patch_base }}"
+    cleanup_targets:
+      - "/u01/patch1926"
+      - "/u01/app/oracle/product/19.0.0.0/dbhome_1.backup.for.switch_back"
+      - "/u01/app/19.0.0.0/grid.backup.for.switch_back"
+    whitelist_prefixes:
+      - "/u01/patch"
+      - "/u01/app/oracle/product/"
+      - "/u01/app/19.0.0.0/"
+    safe_cleanup: true
+    artifact_base_dir: "/tmp/aap_ru"
+
+  tasks:
+    - name: Validate required variables for JT01
+      ansible.builtin.assert:
+        that:
+          - change_id | length > 0
+          - patch_base | length > 0
+          - backup_dir_node1 | length > 0
+          - backup_dir_node2 | length > 0
+          - gimage_dir | length > 0
+        fail_msg: "JT01 required variables are missing."
+
+    - name: Ensure JT01 artifact directory exists
+      ansible.builtin.file:
+        path: "{{ artifact_base_dir }}/{{ change_id }}"
+        state: directory
+        mode: "0750"
+
+    - name: Ensure patch and backup directories exist
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0750"
+      loop:
+        - "{{ backup_dir_node1 }}"
+        - "{{ backup_dir_node2 }}"
+        - "{{ gimage_dir }}"
+      register: ensure_dirs_result
+
+    - name: Check RU tool source exists before copy
+      ansible.builtin.stat:
+        path: "{{ ru_tool_source }}"
+      register: ru_tool_source_stat
+
+    - name: Copy RU tool directory to patch base when source exists
+      ansible.builtin.command:
+        cmd: "cp -r {{ ru_tool_source }} {{ ru_tool_dest_parent }}/"
+      when: ru_tool_source_stat.stat.exists
+      register: ru_tool_copy_cmd
+      changed_when: ru_tool_copy_cmd.rc == 0
+
+    - name: Validate cleanup targets are non-empty and in whitelist
+      ansible.builtin.assert:
+        that:
+          - item | length > 1
+          - item is match('^(' ~ (whitelist_prefixes | map('regex_escape') | join('|')) ~ ')')
+        fail_msg: "Unsafe cleanup target detected: {{ item }}"
+      loop: "{{ cleanup_targets }}"
+      when: safe_cleanup | bool
+
+    - name: Remove cleanup targets
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop: "{{ cleanup_targets }}"
+      register: cleanup_result
+
+    - name: Re-check mandatory directories
+      ansible.builtin.stat:
+        path: "{{ item }}"
+      loop:
+        - "{{ backup_dir_node1 }}"
+        - "{{ backup_dir_node2 }}"
+        - "{{ gimage_dir }}"
+      register: jt01_mandatory_dirs_stat
+
+    - name: Assert mandatory directories exist after cleanup
+      ansible.builtin.assert:
+        that:
+          - item.stat.exists
+          - item.stat.isdir
+        fail_msg: "Mandatory directory missing after JT01: {{ item.item }}"
+      loop: "{{ jt01_mandatory_dirs_stat.results }}"
+
+    - name: Build JT01 result object
+      ansible.builtin.set_fact:
+        jt01_result:
+          stage: "JT01_prepare_dirs_cleanup"
+          change_id: "{{ change_id }}"
+          host: "{{ inventory_hostname }}"
+          timestamp: "{{ lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ') }}"
+          patch_base: "{{ patch_base }}"
+          directories_prepared:
+            - "{{ backup_dir_node1 }}"
+            - "{{ backup_dir_node2 }}"
+            - "{{ gimage_dir }}"
+          ru_tool_copy:
+            source: "{{ ru_tool_source }}"
+            destination_parent: "{{ ru_tool_dest_parent }}"
+            copied: "{{ ru_tool_source_stat.stat.exists }}"
+            rc: "{{ ru_tool_copy_cmd.rc | default(-1) }}"
+          cleanup:
+            safe_cleanup: "{{ safe_cleanup | bool }}"
+            targets: "{{ cleanup_targets }}"
+            changed: "{{ cleanup_result.results | selectattr('changed', 'equalto', true) | map(attribute='path') | list }}"
+          success: true
+
+    - name: Persist JT01 result json artifact
+      ansible.builtin.copy:
+        dest: "{{ artifact_base_dir }}/{{ change_id }}/jt01_result_{{ inventory_hostname }}.json"
+        content: "{{ jt01_result | to_nice_json }}\n"
+        mode: "0640"
+
+    - name: Publish JT01 summary to workflow stats
+      ansible.builtin.set_stats:
+        data:
+          jt01_success: "{{ jt01_result.success }}"
+          jt01_artifact: "{{ artifact_base_dir }}/{{ change_id }}/jt01_result_{{ inventory_hostname }}.json"
