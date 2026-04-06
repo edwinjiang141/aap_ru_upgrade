@@ -195,11 +195,162 @@ WF_ru_mid_jt00_jt01
 - **Artifacts**：`/tmp/aap_ru/${change_id}/jt00_result.json`、`/tmp/aap_ru/${change_id}/jt01_result.json`；
 - **并发策略**：JT00/JT01 阶段建议串行（`serial: 1`），避免并发清理风险。
 
-#### 5.3.5 本轮细化的边界说明
+#### 5.3.5 上一轮细化边界（保留说明）
 
 - 本节仅细化 JT00/JT01，不展开 JT02+；
 - 继续坚持“编排接入优先，RU 工具不重写”的原则；
-- 下一步可基于本节直接输出 JT00/JT01 Playbook skeleton（含任务、变量、失败分支）。
+- 本轮已在 5.4 继续补齐 JT02~JT11 细化。
+
+### 5.4 JT02~JT11 工作流细化（结合两份文档）
+
+> 本节按与 JT00/JT01 相同口径继续细化剩余任务：每个 JT 给出目标、命令映射、成功标准、失败处理、关键输入变量。  
+> 命令来源：`Dbass_RU_生产升级步骤梳理.md`；流程骨架来源：本方案第 5 章。
+
+#### 5.4.1 JT02_backup_node2
+
+**目标**：先备份 node2 当前运行环境。  
+**命令映射**：`cd ${TOOL_DIR} && perl upgrade_ru_with_gold_image --step_00_backup --backup_dir=${BACKUP_DIR_NODE2}`。
+
+- 成功标准：返回码=0，备份目录存在且非空；
+- 失败处理：终止流程，记录备份目录与错误日志；
+- 关键变量：`tool_dir`、`backup_dir_node2`。
+
+#### 5.4.2 JT03_backup_node1
+
+**目标**：再备份 node1 当前运行环境。  
+**命令映射**：`cd ${TOOL_DIR} && perl upgrade_ru_with_gold_image --step_00_backup --backup_dir=${BACKUP_DIR_NODE1}`。
+
+- 成功标准：返回码=0，备份目录存在且非空；
+- 失败处理：终止流程，建议从 JT03 重试或人工核验 node1；
+- 关键变量：`tool_dir`、`backup_dir_node1`。
+
+#### 5.4.3 JT04_unzip_gold_image
+
+**目标**：完成 Gold Image 分发与解压（各节点）。  
+**命令映射**：  
+- 分发（可选）：`scp *.zip <target-host>:/u01/patch1928/gimage`；  
+- 解压：`perl upgrade_ru_with_gold_image --step_00_unzip --unzip_switch_backup_image --target_grid_home=${TARGET_GRID_HOME} --target_oracle_home=${TARGET_DB_HOME} --grid_image=${GRID_IMAGE} --db_image=${DB_IMAGE}`；  
+- 校验：`ls -l ${TARGET_GRID_HOME} ${TARGET_DB_HOME}`。
+
+- 成功标准：解压命令返回码=0，目标 Home 路径存在；
+- 失败处理：保留日志，禁止进入切换类 JT06/JT07；
+- 关键变量：`grid_image`、`db_image`、`target_grid_home`、`target_db_home`。
+
+#### 5.4.4 JT05_collect_baseline
+
+**目标**：采集切换前基线，供升级后比对与恢复。  
+**命令映射**：  
+- `find ./ -type l -exec ls -l {} \; > /tmp/grid_symlink_before.log`；  
+- `find ./ -type l -exec ls -l {} \; > /tmp/db_symlink_before.log`；  
+- `su - grid -c 'crsctl stat res -t > ~/crsctl_stat_before.log'`；  
+- `sh check_tempfile.sh`。
+
+- 成功标准：4 类基线文件全部生成；
+- 失败处理：标记“基线不完整”，阻断进入 rolling；
+- 关键变量：`baseline_dir`、`grid_user`、`oracle_user`。
+
+#### 5.4.5 Approval_A（进入 rolling 前人工确认）
+
+**目标**：在执行停实例与切换前进行变更确认。  
+**建议确认项**：
+1. JT00~JT05 全部成功；
+2. 业务确认可进入短时实例切换窗口；
+3. 回退联系人与沟通群在线。
+
+- 通过：进入 JT06；
+- 拒绝：流程结束并回传“人工终止”状态。
+
+#### 5.4.6 JT06_rolling_switch_node2
+
+**目标**：先切 node2（严格按 RAC rolling 顺序）。  
+**命令映射**：  
+- `srvctl stop instance -node <node2> -f`；  
+- `/usr/bin/perl upgrade_ru_with_gold_image --step_52_switch_one_node_to_original_path_not_start_instance --target_grid_home=${TARGET_GRID_HOME} --target_oracle_home=${TARGET_DB_HOME}`；  
+- `srvctl start instance -node <node2>`。
+
+- 成功标准：停/切/启均成功，实例恢复在线；
+- 失败处理：停止后续节点，保留 node2 操作证据，进入故障分支；
+- 关键变量：`node2_hostname`、`target_grid_home`、`target_db_home`。
+
+#### 5.4.7 JT07_rolling_switch_node1
+
+**目标**：再切 node1。  
+**命令映射**：  
+- `srvctl stop instance -node <node1> -f`；  
+- `/usr/bin/perl upgrade_ru_with_gold_image --step_52_switch_one_node_to_original_path_not_start_instance --target_grid_home=${TARGET_GRID_HOME} --target_oracle_home=${TARGET_DB_HOME}`；  
+- `srvctl start instance -node <node1>`。
+
+- 成功标准：停/切/启均成功，实例恢复在线；
+- 失败处理：进入故障分支，保留日志并触发 DBA 复核；
+- 关键变量：`node1_hostname`、`target_grid_home`、`target_db_home`。
+
+#### 5.4.8 JT08_datapatch
+
+**目标**：执行补丁 SQL 收敛，并恢复参数。  
+**命令映射**：  
+- `sh set_pars.sh`（`job_queue_processes=0`）；  
+- `cd ${TOOL_DIR} && perl upgrade_ru_with_gold_image --step_08_datapatch`；  
+- `sh set_pars.sh`（恢复 `job_queue_processes=160`）。
+
+- 成功标准：datapatch 返回码=0，参数恢复成功；
+- 失败处理：保持证据并阻断收尾，防止“半升级”结束；
+- 关键变量：`tool_dir`、`job_queue_low`、`job_queue_restore`。
+
+#### 5.4.9 Approval_B（收尾前人工确认）
+
+**目标**：确认 datapatch 结束后进入修复/核查收尾。  
+**建议确认项**：
+1. JT08 完成且无阻断告警；
+2. 当前业务可继续执行软链接恢复与健康检查。
+
+- 通过：进入 JT09；
+- 拒绝：流程暂停，等待人工处置。
+
+#### 5.4.10 JT09_restore_links
+
+**目标**：恢复 Oracle/Grid Home 关键软链接。  
+**命令映射**：按基线执行 `ln -s ...`（如 `exachk`、`python3`、`libobk.so64`、`tfactl`、`cmdllroot.sh`）。
+
+- 成功标准：关键链接存在且指向正确；
+- 失败处理：记录失败链接清单，禁止进入最终验收；
+- 关键变量：`link_restore_template` 或 `baseline_link_file`。
+
+#### 5.4.11 JT10_postcheck_compare
+
+**目标**：升级后健康检查与前后对比。  
+**命令映射**：  
+- `sh check_version.sh`；`sh check_sqlpatch.sh`；`sh check_pdb.sh | grep -v SEED`；  
+- `su - grid -c 'crsctl stat res -t > ~/after_upgrade.log'`；  
+- `su - grid -c 'diff ~/after_upgrade.log ~/crsctl_stat_before.log'`。
+
+- 成功标准：版本/sqlpatch/pdb/cluster 对比均通过；
+- 失败处理：输出差异报告，标记“需人工复核”，不自动关单；
+- 关键变量：`postcheck_dir`、`baseline_crs_file`。
+
+#### 5.4.12 JT11_finalize_and_export
+
+**目标**：参数收口、清理中间目录、导出执行摘要并回写。  
+**命令映射**：  
+- `rm -rf /u01/app/oracle/product/19.0.0.0/dbhome_1.backup.for.switch_back`；  
+- `rm -rf /u01/app/19.0.0.0/grid.backup.for.switch_back`；  
+- `sh set_pars.sh`（收口 `_adg_parselock_timeout`）；  
+- 生成 `change_id` 对应 `summary.json/summary.md`。
+
+- 成功标准：清理完成、参数收口完成、摘要可回传；
+- 失败处理：流程标记“部分完成”，由人工补收尾并回写原因；
+- 关键变量：`change_id`、`summary_output_dir`。
+
+#### 5.4.13 JT02~JT11 串联规则（推荐）
+
+```text
+JT02 -> JT03 -> JT04 -> JT05 -> Approval_A
+      -> JT06 -> JT07 -> JT08 -> Approval_B
+      -> JT09 -> JT10 -> JT11 -> Notification
+```
+
+- 所有关键 JT 均要求：`rc==0` + 关键产物存在；
+- 任一关键 JT 失败：走统一故障分支（采集日志 + 建议 resume_step + 通知）；
+- Resume 建议锚点：`JT03/JT06/JT08/JT10`（分别覆盖备份、切换、datapatch、验收四大阶段）。
 
 ---
 
